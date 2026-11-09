@@ -75,8 +75,12 @@ final class PlayHistory {
                 return;
             }
             boolean changed = false;
-            for (String[] p : parse(c, dump)) changed |= record(c, p[0], p[1], p[2]);
-            changed |= fillArt(c);
+            try {
+                for (String[] p : parse(c, dump)) changed |= record(c, p[0], p[1], p[2]);
+                changed |= fillArt(c);
+            } catch (RuntimeException e) {
+                return;   // apps write their own titles: odd text must never crash the launcher
+            }
             Listener l = listener;
             if (changed && l != null) main.post(l::onHistoryChanged);
         }
@@ -148,7 +152,7 @@ final class PlayHistory {
     private static final java.util.regex.Pattern HEADER =
             java.util.regex.Pattern.compile("^( +)\\S.* ([A-Za-z0-9._]+)/.* \\(userId=\\d+\\)$");
     private static final java.util.regex.Pattern STACK =
-            java.util.regex.Pattern.compile("Sessions Stack - have (\\d+) sessions");
+            java.util.regex.Pattern.compile("^  Sessions Stack - have (\\d{1,4}) sessions?:$");
 
     /**
      * Playing sessions as {package, title, subtitle}. Apps control their titles, and a title can
@@ -191,8 +195,12 @@ final class PlayHistory {
                 }
                 continue;
             }
-            java.util.regex.Matcher st = STACK.matcher(raw);
-            if (st.find()) expected = Integer.parseInt(st.group(1));
+            // the count line comes once, before any session block, at its own indentation (an app's
+            // title can't be there: titles only appear inside blocks)
+            if (headers == 0 && expected < 0) {
+                java.util.regex.Matcher st = STACK.matcher(raw);
+                if (st.matches()) expected = Integer.parseInt(st.group(1));   // at most 4 digits
+            }
             if (fieldIndent < 0 || indent(raw) != fieldIndent) continue;
             String line = raw.trim();
             if (pkg == null && line.startsWith("package=")) pkg = line.substring(8);
