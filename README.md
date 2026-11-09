@@ -70,7 +70,7 @@ services, the keyboard, or Play Store/Services.
 
 ### 2. Launcher
 
-Edit `launcher/app/src/main/res/values/config.xml` (dock apps, hidden apps, greeting name, wallpaper),
+Edit `launcher/app/src/main/res/values/config.xml` (dock apps, hidden apps, wallpaper) and, optionally, `launcher/personal.properties` (your name and social accounts; see below),
 then:
 
 ```bash
@@ -156,16 +156,19 @@ All in `launcher/app/src/main/res/values/config.xml`:
   `tools/tv shell "pm list packages | grep -i <name>"`.
 - **Hide an app from the grid:** add it to `hidden_packages`.
 - **Apps per row:** `columns` (3 to 6; 5 by default), for the dock and the grid.
-- **Greeting name:** `greeting_name` (empty for just "Good evening").
+- **Your name and social accounts:** copy `launcher/personal.properties.example` to
+  `launcher/personal.properties` and fill it in. It's git-ignored, so personal details are never
+  published. `greeting_name` adds your name to "Good evening"; `youtube_channel`, `instagram_user`
+  and `facebook_page` turn on the follower counters (leave any empty to hide it).
 - **Wallpapers:** add photos from the phone page (easiest), or put 1280×720 images named
   `wallpaper_1.jpg`, `wallpaper_2.jpg`, … in `launcher/app/src/main/res/drawable-nodpi/` before
   building. They're copied into the TV's photo store on first run and then managed from the phone.
   A `wallpaper_1_o.jpg` next to one is its full-size version, used when re-framing. These files are
   git-ignored so personal photos don't get published. `wallpaper_seconds` sets how often they change
   (30 by default); `use_wallpaper` `false` keeps the background pitch black.
-- **Follower counters:** `youtube_channel`, `instagram_user`, `facebook_page`. Leave any empty to
-  hide it. They're read from each profile's public page every 30 minutes (no API keys), so they can
-  stop updating if a site changes its page; they then keep showing the last number.
+- **Follower counters** (accounts set in `personal.properties`, above) are read from each profile's
+  public page every 30 minutes (no API keys), so they can stop updating if a site changes its page;
+  they then keep showing the last number.
 
 ## Troubleshooting
 

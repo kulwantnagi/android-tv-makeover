@@ -10,8 +10,16 @@
         <item>com.nk.live_tv</item>
     </string-array>
 
-    <!-- Apps per row, in the dock and in the grid (3 to 6). -->
+    <!-- Apps per row in the grid (3 to 6). -->
     <integer name="columns">5</integer>
+
+    <!-- Dock slots the dock cards are sized for (4 to 8). The tray hugs however many dock apps
+         there are, centred; add packages above to fill it. -->
+    <integer name="dock_columns">5</integer>
+
+    <!-- "Last played" thumbnails above the dock for the focused app. false = never shown, and the
+         launcher stops checking what's playing. -->
+    <bool name="show_recently_watched">false</bool>
 
     <!-- Apps never shown in the grid. -->
     <string-array name="hidden_packages">
@@ -21,17 +29,9 @@
         <item>com.android.gallery3d</item>
     </string-array>
 
-    <!-- Name in the greeting ("Good evening, Sam"). Leave empty for no name. -->
-    <string name="greeting_name"></string>
+    <!-- Your name for the greeting and your social accounts for the follower counters live in
+         launcher/personal.properties (git-ignored, so they're never published): see the README. -->
 
-    <!-- Follower counters under the top-right buttons, refreshed every 30 minutes while the home
-         screen is open. Leave any of them empty to hide that counter. -->
-    <!-- YouTube channel handle -->
-    <string name="youtube_channel">@AIWithKulwant</string>
-    <!-- Instagram username (instagram.com/<this>) -->
-    <string name="instagram_user">kulwantnagi</string>
-    <!-- Facebook profile or page name (facebook.com/<this>) -->
-    <string name="facebook_page">kulwant.nagi</string>
 
     <!-- Wallpapers: 1280x720 images named wallpaper_1.jpg, wallpaper_2.jpg, ... in res/drawable-nodpi/.
          With more than one they fade from one to the next every wallpaper_seconds. false = pitch black. -->

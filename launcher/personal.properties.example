@@ -1,0 +1,7 @@
+# Copy to personal.properties (git-ignored) and fill in. Leave a value empty to hide it.
+# Name in the greeting ("Good evening, Sam").
+greeting_name=
+# Follower counters under the top-right buttons.
+youtube_channel=@yourchannel
+instagram_user=yourname
+facebook_page=your.page

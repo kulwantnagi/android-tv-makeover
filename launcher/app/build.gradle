@@ -13,6 +13,15 @@ android {
         targetSdk 28
         versionCode 1
         versionName '1.0'
+
+        // Personal settings come from launcher/personal.properties (git-ignored), so they're never
+        // published. Each one is optional: empty hides the greeting name / that counter.
+        def personal = new Properties()
+        def personalFile = rootProject.file('personal.properties')
+        if (personalFile.exists()) personalFile.withInputStream { personal.load(it) }
+        ['greeting_name', 'youtube_channel', 'instagram_user', 'facebook_page'].each { key ->
+            resValue 'string', key, personal.getProperty(key, '').replace('@', '\\@')
+        }
     }
 
     compileOptions {

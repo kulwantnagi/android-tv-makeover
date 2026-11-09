@@ -26,3 +26,6 @@ apps/live-tv/android/build/
 
 # Your own wallpapers (personal photos): put them in launcher/app/src/main/res/drawable-nodpi/
 launcher/app/src/main/res/drawable-nodpi/wallpaper*
+
+# Your name and social accounts for the launcher (see personal.properties.example)
+launcher/personal.properties

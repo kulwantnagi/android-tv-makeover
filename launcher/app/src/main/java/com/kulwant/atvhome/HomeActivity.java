@@ -44,27 +44,42 @@ import java.util.concurrent.Executors;
  * Apple TV style home screen. All D-pad navigation is handled here (no Android focus search), so
  * movement is deterministic: zones TOP (pills) / DOCK / GRID, Up/Down move exactly one row.
  */
-public class HomeActivity extends Activity implements Wallpapers.Listener {
+public class HomeActivity extends Activity implements Wallpapers.Listener, PlayHistory.Listener {
 
-    private enum Zone { TOP, DOCK, GRID }
+    private enum Zone { TOP, RECENT, DOCK, GRID }
 
     private static final int PILLS = 3;
-    /** apps per row, dock and grid (config.xml: columns) */
+    /** apps per grid row (config.xml: columns) */
     private int COLS;
+    /** dock slots the dock cards are sized for (config.xml: dock_columns); the tray hugs the apps */
+    private int DOCK_COLS;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService io = Executors.newSingleThreadExecutor();
     private SharedPreferences prefs;
 
     // layout (px)
-    private int W, H, side, bandTop, gridTop, rowH;
+    private int W, H, side, bandTop, bandH, trayPad, dockCell, dockCardW, dockCardH, gridTop, rowH;
 
     private FrameLayout root, content;
-    private TextView greeting, clock, date, dockTitle, wifiText;
+    private TextView greeting, clock, date, dockTitle;
+    private ImageView wifiIcon;
+    private View band;
+    private Frost frost;
+    private Sheen sheen;
+
+    // Top Shelf: while you move along the dock, the background becomes the focused app's picture
+    // (res/drawable-nodpi/shelf_<package, dots as _>.jpg). Photos come back after SHELF_IDLE_MS
+    // without a key press, when focus leaves the dock, or on returning Home.
+    private static final long SHELF_IDLE_MS = 20_000;
+    private final ImageView[] shelfViews = new ImageView[2];
+    private int shelfFront;
+    private String shelfPkg;   // app whose picture is up, or null when the photos show
+    private final java.util.Map<String, android.graphics.Bitmap[]> shelfCache = new java.util.HashMap<>();
+    private android.graphics.Bitmap wallBlur;
     private LinearLayout pillRow;
-    // follower counters under the pills: YouTube, Instagram, Facebook
+    // follower counters under the round buttons: YouTube, Instagram, Facebook
     private static final String[] SOCIAL_KEYS = {"yt", "ig", "fb"};
-    private static final String[] SOCIAL_UNITS = {"subscribers", "followers", "followers"};
     private final String[] socialIds = new String[3];
     private final View[] socialPills = new View[3];
     private final TextView[] socialTexts = new TextView[3];
@@ -77,9 +92,20 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
     private RecyclerView dockRv, gridRv;
     private TileAdapter dockAdapter, gridAdapter;
     private InputsMenu inputs;
+    private SettingsTray tray;
+
+    // "last played" row above the dock: the focused dock app's newest PlayHistory items
+    // small on purpose: the row sits over the wallpaper photo
+    private static final int RECENT_W = 128, RECENT_H = 72, RECENT_GAP = 8;
+    private LinearLayout recentRow;
+    private final View[] recentCards = new View[PlayHistory.PER_APP];
+    private final ImageView[] recentArts = new ImageView[PlayHistory.PER_APP];
+    private final TextView[] recentTitles = new TextView[PlayHistory.PER_APP];
+    private final TextView[] recentSubs = new TextView[PlayHistory.PER_APP];
+    private final List<PlayHistory.Item> recents = new ArrayList<>();
 
     private Zone zone = Zone.DOCK;
-    private int topIdx, dockIdx, gridIdx;
+    private int topIdx, recentIdx, dockIdx, gridIdx;
     private final RectF hl = new RectF();
     private float hlRadius, hlRadiusNow;
     private boolean hlPlaced;
@@ -100,11 +126,12 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         super.onCreate(b);
         prefs = getSharedPreferences("home", MODE_PRIVATE);
         COLS = Math.max(3, Math.min(6, getResources().getInteger(R.integer.columns)));
+        DOCK_COLS = Math.max(4, Math.min(8, getResources().getInteger(R.integer.dock_columns)));
         zone = Zone.values()[prefs.getInt("zone", Zone.DOCK.ordinal())];
         topIdx = prefs.getInt("top", 0);
         dockIdx = prefs.getInt("dock", 0);
         gridIdx = prefs.getInt("grid", 0);
-        if (zone == Zone.TOP) zone = Zone.DOCK;   // come back to apps, not the buttons
+        if (zone == Zone.TOP || zone == Zone.RECENT) zone = Zone.DOCK;   // come back to apps, not the buttons
 
         buildUi();
         setContentView(root);
@@ -131,6 +158,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         loadApps();
 
         Wallpapers.setListener(this);
+        PlayHistory.setListener(this);
         startForegroundService(new Intent(this, PhoneService.class));
     }
 
@@ -140,8 +168,14 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         updateClock();
         updateWifi();
         if (inputs.isOpen()) inputs.close();
+        tray.close();
         scheduleMinute();
         scheduleWallpaper();
+        showRecents();   // refreshes the "2 h ago" labels
+        // catch what was playing just before Home was pressed (the service only looks every few seconds)
+        if (getResources().getBoolean(R.bool.show_recently_watched)) {
+            io.execute(() -> PlayHistory.poll(getApplicationContext()));
+        }
         if (hasSocial && System.currentTimeMillis() - prefs.getLong("counts_at", 0) > SUBS_REFRESH_MS) {
             refreshSubs.run();
         } else if (hasSocial) {
@@ -152,6 +186,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
     @Override
     protected void onPause() {
         // nothing ticks (and no wallpaper is decoded) while an app is in front
+        hideShelf(0);
         main.removeCallbacks(minuteTick);
         main.removeCallbacks(nextWallpaper);
         main.removeCallbacks(refreshSubs);
@@ -175,6 +210,8 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         super.onNewIntent(intent);
         // Home pressed while already home: close menus and return to the dock.
         if (inputs.isOpen()) inputs.close();
+        tray.close();
+        hideShelf(450);
         if (zone == Zone.GRID && hasWindowFocus()) {
             zone = Zone.DOCK;
             applyFocus(true);
@@ -186,6 +223,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         unregisterReceiver(statusReceiver);
         unregisterReceiver(packageReceiver);
         Wallpapers.setListener(null);
+        PlayHistory.setListener(null);
         io.shutdownNow();
         super.onDestroy();
     }
@@ -217,6 +255,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
     private void setApps(AppRepo.Result r) {
         dockAdapter.setApps(r.dock);
         gridAdapter.setApps(r.grid);
+        layoutDock(Math.max(1, r.dock.size()));
         int rows = (r.grid.size() + COLS - 1) / COLS;
         ViewGroup.LayoutParams glp = gridRv.getLayoutParams();
         glp.height = Math.max(rows, 1) * rowH;
@@ -247,14 +286,17 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
     private void buildUi() {
         W = getResources().getDisplayMetrics().widthPixels;
         H = getResources().getDisplayMetrics().heightPixels;
-        side = dp(40);
-        // cells shrink to fit COLS per row; cards keep the 16:9 TV banner shape
+        side = dp(48);
+        // cells shrink to fit DOCK_COLS / COLS per row; cards keep the 16:9 TV banner shape
         int gap = dp(24);
-        int dockCell = (W - 2 * side - 2 * dp(16)) / COLS, dockCardW = dockCell - gap;
-        int dockCardH = dockCardW * 9 / 16;
+        trayPad = dp(18);
+        dockCell = (W - 2 * side - 2 * trayPad) / DOCK_COLS;
+        dockCardW = dockCell - dp(18);
+        dockCardH = dockCardW * 9 / 16;
         int gridCell = (W - 2 * side + gap) / COLS, gridCardW = gridCell - gap;
         int gridCardH = gridCardW * 9 / 16;
-        int bandH = dockCardH + dp(28), bandBottom = dp(26);
+        bandH = dockCardH + dp(40);
+        int bandBottom = dp(30);
         bandTop = H - bandBottom - bandH;
         rowH = gridCardH + dp(42);
         gridTop = H + dp(56);
@@ -274,7 +316,21 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
             }
             if (!wallpapers.isEmpty()) {
                 wpIdx = prefs.getInt("wallpaper", 0) % wallpapers.size();
-                wpViews[0].setImageBitmap(loadWallpaper(wallpapers.get(wpIdx)));
+                android.graphics.Bitmap first = loadWallpaper(wallpapers.get(wpIdx));
+                wpViews[0].setImageBitmap(first);
+                io.execute(() -> {
+                    android.graphics.Bitmap b = Frost.blurred(first);
+                    main.post(() -> {
+                        wallBlur = b;
+                        if (shelfPkg == null && frost != null) frost.setSource(b, 0);
+                    });
+                });
+            }
+            for (int i = 0; i < 2; i++) {
+                shelfViews[i] = new ImageView(this);
+                shelfViews[i].setScaleType(ImageView.ScaleType.CENTER_CROP);
+                shelfViews[i].setAlpha(0f);
+                root.addView(shelfViews[i], new FrameLayout.LayoutParams(-1, -1));
             }
             // darken: evenly, and more towards the bottom where the dock and grid sit
             View scrim = new View(this);
@@ -298,12 +354,16 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         glowBg.setColors(new int[]{0, 0});
         glow.setBackground(glowBg);
         glow.setScaleY(0.45f);
-        int glowCx = side + dp(110), glowCy = bandTop - dp(44);
-        content.addView(glow, at(dp(900), dp(600), glowCx - dp(360), glowCy - dp(300)));
+        content.addView(glow, at(dp(900), dp(600), 0, bandTop - dp(40) - dp(300)));
 
-        // dock band
-        View band = new View(this);
-        band.setBackground(Ui.rounded(useWallpaper ? 0x8C141416 : 0xFF141416, dp(28), dp(1), 0x14FFFFFF));
+        // dock tray: frosted glass, centred, hugging the dock apps (sized in layoutDock)
+        if (useWallpaper) {
+            frost = new Frost(this, dp(30), W, H);
+            band = frost;
+        } else {
+            band = new View(this);
+            band.setBackground(Ui.rounded(0xFF1C1C1E, dp(30), dp(1), 0x33FFFFFF));
+        }
         content.addView(band, at(W - 2 * side, bandH, side, bandTop));
 
         // the single glass highlight (below tiles and pills)
@@ -311,84 +371,96 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         highlight.setAlpha(0f);
         content.addView(highlight, new FrameLayout.LayoutParams(-1, -1));
 
-        // greeting, clock, date
+        // large greeting title, then clock and date as a quiet "tab" row under it
         LinearLayout tl = new LinearLayout(this);
         tl.setOrientation(LinearLayout.VERTICAL);
-        greeting = Ui.text(this, 400, 16, 0x99FFFFFF);
-        clock = Ui.text(this, 150, 78, 0xFFFFFFFF);
-        clock.setLetterSpacing(-0.02f);
-        date = Ui.text(this, 300, 17, 0x99FFFFFF);
+        greeting = Ui.text(this, 500, 44, 0xFFFFFFFF);
+        greeting.setLetterSpacing(-0.015f);
         tl.addView(greeting);
-        LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(-2, -2);
-        clp.topMargin = dp(4);
-        clp.leftMargin = -dp(3);
-        tl.addView(clock, clp);
+        LinearLayout tabs = new LinearLayout(this);
+        tabs.setOrientation(LinearLayout.HORIZONTAL);
+        tabs.setGravity(Gravity.BOTTOM);
+        clock = Ui.text(this, 600, 18, 0xFFFFFFFF);
+        date = Ui.text(this, 400, 18, 0x99FFFFFF);
+        tabs.addView(clock);
         LinearLayout.LayoutParams dlp = new LinearLayout.LayoutParams(-2, -2);
-        dlp.topMargin = dp(6);
-        tl.addView(date, dlp);
-        content.addView(tl, at(W / 2, -2, side, dp(34)));
+        dlp.leftMargin = dp(28);
+        tabs.addView(date, dlp);
+        LinearLayout.LayoutParams tbp = new LinearLayout.LayoutParams(-2, -2);
+        tbp.topMargin = dp(16);
+        tbp.leftMargin = dp(2);
+        tl.addView(tabs, tbp);
+        content.addView(tl, at(W * 2 / 3, -2, side, dp(46)));
 
-        // pills: Inputs, Wi-Fi, Settings
+        // round buttons: Inputs, Wi-Fi, Settings
         pillRow = new LinearLayout(this);
         pillRow.setOrientation(LinearLayout.HORIZONTAL);
-        pills[0] = pill(R.drawable.ic_input, "Inputs");
-        pills[1] = pill(R.drawable.ic_wifi, "Wi-Fi");
-        wifiText = (TextView) ((ViewGroup) pills[1]).getChildAt(1);
-        pills[2] = pill(R.drawable.ic_settings, null);
+        pills[0] = pill(R.drawable.ic_input);
+        pills[1] = pill(R.drawable.ic_wifi);
+        wifiIcon = (ImageView) ((ViewGroup) pills[1]).getChildAt(0);
+        pills[2] = pill(R.drawable.ic_settings);
         for (int i = 0; i < PILLS; i++) {
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, dp(36));
-            if (i > 0) lp.leftMargin = dp(10);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(44), dp(44));
+            if (i > 0) lp.leftMargin = dp(14);
             pillRow.addView(pills[i], lp);
         }
         FrameLayout.LayoutParams plp = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END);
-        plp.topMargin = dp(36);
+        plp.topMargin = dp(40);
         plp.rightMargin = side;
         content.addView(pillRow, plp);
 
-        // follower counters, right-aligned under the pills (display only, never focused)
+        // follower counters: one compact row under the buttons (display only, never focused)
         socialIds[0] = getString(R.string.youtube_channel).trim();
         socialIds[1] = getString(R.string.instagram_user).trim();
         socialIds[2] = getString(R.string.facebook_page).trim();
         int[] logos = {R.drawable.ic_youtube, R.drawable.ic_instagram, R.drawable.ic_facebook};
         LinearLayout counters = new LinearLayout(this);
-        counters.setOrientation(LinearLayout.VERTICAL);
-        counters.setGravity(Gravity.END);
+        counters.setOrientation(LinearLayout.HORIZONTAL);
+        counters.setGravity(Gravity.CENTER_VERTICAL | Gravity.END);
         for (int i = 0; i < 3; i++) {
             if (socialIds[i].isEmpty()) continue;
             hasSocial = true;
             LinearLayout sp = new LinearLayout(this);
             sp.setOrientation(LinearLayout.HORIZONTAL);
             sp.setGravity(Gravity.CENTER_VERTICAL);
-            sp.setBackground(Ui.rounded(0x33000000, dp(16), dp(1), 0x1FFFFFFF));
-            sp.setPadding(dp(12), 0, dp(14), 0);
             ImageView logo = new ImageView(this);
             logo.setImageResource(logos[i]);
-            sp.addView(logo, new LinearLayout.LayoutParams(dp(20), dp(20)));
-            socialTexts[i] = Ui.text(this, 500, 14, 0xFFFFFFFF);
+            sp.addView(logo, new LinearLayout.LayoutParams(dp(16), dp(16)));
+            socialTexts[i] = Ui.text(this, 500, 14, 0xD9FFFFFF);
             LinearLayout.LayoutParams tlp = new LinearLayout.LayoutParams(-2, -2);
-            tlp.leftMargin = dp(8);
+            tlp.leftMargin = dp(6);
             sp.addView(socialTexts[i], tlp);
-            LinearLayout.LayoutParams plp2 = new LinearLayout.LayoutParams(-2, dp(32));
-            plp2.topMargin = dp(8);
-            counters.addView(sp, plp2);
+            LinearLayout.LayoutParams slp = new LinearLayout.LayoutParams(-2, -2);
+            slp.leftMargin = dp(18);
+            counters.addView(sp, slp);
             socialPills[i] = sp;
             showCount(i, prefs.getString("count_" + SOCIAL_KEYS[i], null));
         }
         FrameLayout.LayoutParams clp2 = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.END);
-        clp2.topMargin = dp(36 + 36 + 2);
-        clp2.rightMargin = side;
+        clp2.topMargin = dp(40 + 44 + 26);
+        clp2.rightMargin = side + dp(4);
         content.addView(counters, clp2);
 
-        // focused dock app name
-        dockTitle = Ui.text(this, 250, 44, 0xF2FFFFFF);
-        dockTitle.setLetterSpacing(-0.01f);
-        content.addView(dockTitle, at(W - 2 * side, -2, side + dp(28), bandTop - dp(72)));
+        // focused dock app name, above the tray's left edge
+        dockTitle = Ui.text(this, 500, 26, 0xF2FFFFFF);
+        content.addView(dockTitle, at(W - 2 * side, -2, side, bandTop - dp(46)));
+
+        // last played: small text cards just above the tray, only while the app has history
+        recentRow = new LinearLayout(this);
+        recentRow.setOrientation(LinearLayout.HORIZONTAL);
+        recentRow.setAlpha(0f);
+        for (int i = 0; i < PlayHistory.PER_APP; i++) {
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(dp(RECENT_W), dp(RECENT_H));
+            if (i > 0) lp.leftMargin = dp(RECENT_GAP);
+            recentRow.addView(recentCard(i), lp);
+        }
+        content.addView(recentRow, at(-2, dp(RECENT_H), side, bandTop - dp(10 + RECENT_H)));
 
         // dock
         dockAdapter = new TileAdapter(dockCell, dockCardW, dockCardH, 0, false);
         dockRv = recycler(new LinearLayoutManager(this, RecyclerView.HORIZONTAL, false), dockAdapter);
-        content.addView(dockRv, at(dockCell * COLS, dockCardH, side + dp(28) - (dockCell - dockCardW) / 2,
-                bandTop + (bandH - dockCardH) / 2));
+        content.addView(dockRv, at(dockCell * DOCK_COLS, dockCardH, side, bandTop + (bandH - dockCardH) / 2));
+        layoutDock(DOCK_COLS);
 
         // grid
         TextView appsHeader = Ui.text(this, 500, 15, 0x80FFFFFF);
@@ -399,8 +471,15 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         gridRv = recycler(new GridLayoutManager(this, COLS), gridAdapter);
         content.addView(gridRv, at(gridCell * COLS, rowH, side - (gridCell - gridCardW) / 2, gridTop));
 
+        // gloss that glides across a tile when focus lands on it (above the tiles)
+        sheen = new Sheen(this);
+        content.addView(sheen, new FrameLayout.LayoutParams(-1, -1));
+
         inputs = new InputsMenu(this);
         root.addView(inputs.panel);
+        tray = new SettingsTray(this, W, H, trayHost);
+        root.addView(tray.scrim, new FrameLayout.LayoutParams(-1, -1));
+        root.addView(tray.panel);
     }
 
     private FrameLayout.LayoutParams at(int w, int h, int x, int y) {
@@ -424,26 +503,126 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         return rv;
     }
 
-    private View pill(int icon, String label) {
+    /** Centres the tray, dock and title on the {@code n} dock apps (cards stay sized for DOCK_COLS). */
+    private void layoutDock(int n) {
+        n = Math.min(n, DOCK_COLS);
+        int trayW = dockCell * n + 2 * trayPad, trayX = (W - trayW) / 2;
+        FrameLayout.LayoutParams b = (FrameLayout.LayoutParams) band.getLayoutParams();
+        b.width = trayW;
+        b.leftMargin = trayX;
+        band.setLayoutParams(b);
+        FrameLayout.LayoutParams d = (FrameLayout.LayoutParams) dockRv.getLayoutParams();
+        d.width = dockCell * n;
+        d.leftMargin = trayX + trayPad;
+        dockRv.setLayoutParams(d);
+        int textX = trayX + trayPad + (dockCell - dockCardW) / 2;
+        FrameLayout.LayoutParams t = (FrameLayout.LayoutParams) dockTitle.getLayoutParams();
+        t.leftMargin = textX;
+        dockTitle.setLayoutParams(t);
+        FrameLayout.LayoutParams r = (FrameLayout.LayoutParams) recentRow.getLayoutParams();
+        r.leftMargin = textX;
+        recentRow.setLayoutParams(r);
+        FrameLayout.LayoutParams g = (FrameLayout.LayoutParams) glow.getLayoutParams();
+        g.leftMargin = textX + dp(80) - dp(360);
+        glow.setLayoutParams(g);
+    }
+
+    /** Picture card: thumbnail or poster (cropped to 16:9) with the title on a dark fade at the bottom. */
+    private View recentCard(int i) {
+        FrameLayout card = new FrameLayout(this);
+        card.setBackground(Ui.rounded(0x99000000, dp(12), 0, 0));
+        final float radius = dp(12);
+        card.setOutlineProvider(new android.view.ViewOutlineProvider() {
+            @Override
+            public void getOutline(View v, android.graphics.Outline o) {
+                o.setRoundRect(0, 0, v.getWidth(), v.getHeight(), radius);
+            }
+        });
+        card.setClipToOutline(true);
+        card.setForeground(Ui.rounded(0, radius, dp(1), 0x26FFFFFF));
+        recentArts[i] = new ImageView(this);
+        // posters are portrait: keep the upper part, where titles and faces usually are
+        recentArts[i].setScaleType(ImageView.ScaleType.MATRIX);
+        card.addView(recentArts[i], new FrameLayout.LayoutParams(-1, -1));
+        View fade = new View(this);
+        fade.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{0x00000000, 0x66000000, 0xE6000000}));
+        card.addView(fade, new FrameLayout.LayoutParams(-1, -1));
+        LinearLayout text = new LinearLayout(this);
+        text.setOrientation(LinearLayout.VERTICAL);
+        text.setPadding(dp(8), 0, dp(8), dp(6));
+        recentTitles[i] = Ui.text(this, 600, 12, 0xFFFFFFFF);
+        recentTitles[i].setEllipsize(android.text.TextUtils.TruncateAt.END);
+        text.addView(recentTitles[i]);
+        recentSubs[i] = Ui.text(this, 400, 10, 0xB3FFFFFF);
+        recentSubs[i].setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+        lp.topMargin = dp(3);
+        text.addView(recentSubs[i], lp);
+        card.addView(text, new FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM));
+        recentCards[i] = card;
+        return card;
+    }
+
+    /** Fills the card width and keeps the top of the picture (CENTER_CROP would cut posters' heads off). */
+    private void setArt(ImageView v, android.graphics.Bitmap b) {
+        v.setImageBitmap(b);
+        if (b == null) return;
+        float s = Math.max(dp(RECENT_W) / (float) b.getWidth(), dp(RECENT_H) / (float) b.getHeight());
+        android.graphics.Matrix m = new android.graphics.Matrix();
+        m.setScale(s, s);
+        // landscape thumbnails: centred; portrait posters: from a little below the top
+        float extra = b.getHeight() * s - dp(RECENT_H);
+        m.postTranslate((dp(RECENT_W) - b.getWidth() * s) / 2f,
+                b.getHeight() > b.getWidth() ? -extra * 0.15f : -extra / 2f);
+        v.setImageMatrix(m);
+    }
+
+    /** Fills the row from the focused dock app's history; the title moves up to make room. */
+    private void showRecents() {
+        if (recentRow == null) return;
+        recents.clear();
+        if (getResources().getBoolean(R.bool.show_recently_watched) && dockAdapter.getItemCount() > 0) {
+            recents.addAll(PlayHistory.forApp(this, dockAdapter.apps.get(dockIdx).pkg));
+        }
+        for (int i = 0; i < PlayHistory.PER_APP; i++) {
+            boolean has = i < recents.size();
+            recentCards[i].setVisibility(has ? View.VISIBLE : View.INVISIBLE);
+            if (!has) continue;
+            PlayHistory.Item it = recents.get(i);
+            setArt(recentArts[i], it.art.isEmpty() ? null : android.graphics.BitmapFactory.decodeFile(
+                    new java.io.File(PlayHistory.dir(this), it.art).getPath()));
+            recentTitles[i].setText(it.title);
+            String ago = PlayHistory.ago(it.at);
+            recentSubs[i].setText(it.sub.isEmpty() ? ago : it.sub + " · " + ago);
+        }
+        boolean show = !recents.isEmpty();
+        float lift = show ? -dp(RECENT_H + 10) : 0;
+        recentRow.animate().alpha(show ? 1f : 0f).setDuration(200).start();
+        dockTitle.animate().translationY(lift).setDuration(250).start();
+        glow.animate().translationY(lift).setDuration(250).start();
+        if (zone == Zone.RECENT && !show) {
+            zone = Zone.DOCK;
+            applyFocus(true);
+        } else {
+            recentIdx = Math.max(0, Math.min(recentIdx, recents.size() - 1));
+        }
+    }
+
+    @Override
+    public void onHistoryChanged() {
+        showRecents();
+        if (zone == Zone.RECENT) applyFocus(true);
+    }
+
+    private View pill(int icon) {
         LinearLayout p = new LinearLayout(this);
-        p.setOrientation(LinearLayout.HORIZONTAL);
-        p.setGravity(Gravity.CENTER_VERTICAL);
-        p.setBackground(Ui.rounded(0x1FFFFFFF, dp(18), dp(1), 0x26FFFFFF));
-        int padH = label == null ? dp(9) : dp(14);
-        p.setPadding(padH, 0, padH, 0);
-        p.setAlpha(0.8f);
+        p.setGravity(Gravity.CENTER);
+        p.setBackground(Ui.rounded(0x2EFFFFFF, dp(22), dp(1), 0x33FFFFFF));
+        p.setAlpha(0.85f);
         ImageView iv = new ImageView(this);
         iv.setImageResource(icon);
-        p.addView(iv, new LinearLayout.LayoutParams(dp(18), dp(18)));
-        if (label != null) {
-            TextView t = Ui.text(this, 400, 14, 0xFFFFFFFF);
-            t.setText(label);
-            t.setMaxWidth(dp(170));
-            t.setEllipsize(android.text.TextUtils.TruncateAt.END);
-            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
-            lp.leftMargin = dp(8);
-            p.addView(t, lp);
-        }
+        p.addView(iv, new LinearLayout.LayoutParams(dp(20), dp(20)));
         return p;
     }
 
@@ -546,13 +725,13 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
     private void showCount(int i, String count) {
         if (socialPills[i] == null) return;
         socialPills[i].setVisibility(count == null ? View.GONE : View.VISIBLE);
-        if (count != null) socialTexts[i].setText(count + " " + SOCIAL_UNITS[i]);
+        if (count != null) socialTexts[i].setText(count);
     }
 
     private void scheduleWallpaper() {
         main.removeCallbacks(nextWallpaper);
         if (wallpapers.size() < 2 || wpViews[0] == null) return;
-        int secs = Math.max(5, getResources().getInteger(R.integer.wallpaper_seconds));
+        int secs = Math.max(5, tray.timerSeconds());   // set in the Settings tray, default from config.xml
         main.postDelayed(nextWallpaper, secs * 1000L);
     }
 
@@ -565,7 +744,10 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
         io.execute(() -> {
             android.graphics.Bitmap bmp = loadWallpaper(src);
             if (bmp == null) return;
+            android.graphics.Bitmap blur = Frost.blurred(bmp);
             main.post(() -> {
+                wallBlur = blur;
+                if (shelfPkg == null && frost != null) frost.setSource(blur, 2000);
                 ImageView front = wpViews[wpFront], back = wpViews[1 - wpFront];
                 back.setImageBitmap(bmp);
                 back.animate().alpha(1f).setDuration(2000).start();
@@ -601,7 +783,10 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
                 if (ssid != null && !ssid.isEmpty() && !ssid.equals("<unknown ssid>")) text = ssid;
             }
         }
-        wifiText.setText(text);
+        // icon-only button: dim when offline, network name for accessibility
+        wifiIcon.setAlpha(text.equals("Offline") ? 0.35f : 1f);
+        tray.setWifi(text, !text.equals("Offline"));
+        pills[1].setContentDescription(text);
     }
 
     private static String unquote(String s) {
@@ -623,6 +808,10 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
 
         boolean select = k == KeyEvent.KEYCODE_DPAD_CENTER || k == KeyEvent.KEYCODE_ENTER
                 || k == KeyEvent.KEYCODE_NUMPAD_ENTER;
+        if (tray.isOpen()) {
+            tray.onKey(k, select, e.getRepeatCount() > 0);
+            return true;
+        }
         if (inputs.isOpen()) {
             if (k == KeyEvent.KEYCODE_DPAD_UP) inputs.move(-1);
             else if (k == KeyEvent.KEYCODE_DPAD_DOWN) inputs.move(1);
@@ -653,6 +842,9 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
 
     private void up() {
         if (zone == Zone.DOCK) {
+            zone = recents.isEmpty() ? Zone.TOP : Zone.RECENT;
+            recentIdx = 0;
+        } else if (zone == Zone.RECENT) {
             zone = Zone.TOP;
         } else if (zone == Zone.GRID) {
             if (gridIdx >= COLS) gridIdx -= COLS;
@@ -666,7 +858,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
 
     private void down() {
         int ng = gridAdapter.getItemCount();
-        if (zone == Zone.TOP) {
+        if (zone == Zone.TOP || zone == Zone.RECENT) {
             if (dockAdapter.getItemCount() > 0) zone = Zone.DOCK;
             else if (ng > 0) zone = Zone.GRID;
             else return;
@@ -684,6 +876,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
 
     private void left() {
         if (zone == Zone.TOP && topIdx > 0) topIdx--;
+        else if (zone == Zone.RECENT && recentIdx > 0) recentIdx--;
         else if (zone == Zone.DOCK && dockIdx > 0) dockIdx--;
         else if (zone == Zone.GRID && gridIdx % COLS > 0) gridIdx--;
         else return;
@@ -692,6 +885,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
 
     private void right() {
         if (zone == Zone.TOP && topIdx < PILLS - 1) topIdx++;
+        else if (zone == Zone.RECENT && recentIdx < recents.size() - 1) recentIdx++;
         else if (zone == Zone.DOCK && dockIdx < dockAdapter.getItemCount() - 1) dockIdx++;
         else if (zone == Zone.GRID && gridIdx % COLS < COLS - 1 && gridIdx + 1 < gridAdapter.getItemCount()) gridIdx++;
         else return;
@@ -701,20 +895,83 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
     private void activate() {
         if (zone == Zone.TOP) {
             if (topIdx == 0) {
-                int[] loc = new int[2];
-                pills[0].getLocationInWindow(loc);
-                inputs.open(loc[0], loc[1] + pills[0].getHeight() + dp(8));
+                openInputs();
             } else if (topIdx == 1) {
                 launch(new Intent(Settings.ACTION_WIFI_SETTINGS));
             } else {
-                launch(new Intent(Settings.ACTION_SETTINGS));
+                openTray();
             }
-        } else if (zone == Zone.DOCK && dockIdx < dockAdapter.getItemCount()) {
+        } else if (zone == Zone.RECENT && dockIdx < dockAdapter.getItemCount()) {
+            // a history entry has no link to the exact video (dumpsys doesn't give one): open its app
             launch(AppRepo.launchIntent(getPackageManager(), dockAdapter.apps.get(dockIdx)));
+        } else if (zone == Zone.DOCK && dockIdx < dockAdapter.getItemCount()) {
+            pressThen(dockRv, dockIdx, AppRepo.launchIntent(getPackageManager(), dockAdapter.apps.get(dockIdx)));
         } else if (zone == Zone.GRID && gridIdx < gridAdapter.getItemCount()) {
-            launch(AppRepo.launchIntent(getPackageManager(), gridAdapter.apps.get(gridIdx)));
+            pressThen(gridRv, gridIdx, AppRepo.launchIntent(getPackageManager(), gridAdapter.apps.get(gridIdx)));
         }
     }
+
+    /** The focused tile presses in and springs back, as on Apple TV; the app opens on the way back. */
+    private void pressThen(RecyclerView rv, int pos, Intent i) {
+        RecyclerView.ViewHolder vh = rv.findViewHolderForAdapterPosition(pos);
+        View card = vh == null ? null : vh.itemView.findViewById(R.id.card);
+        if (card == null) {
+            launch(i);
+            return;
+        }
+        float up = TileAdapter.FOCUS_SCALE, down = up * 0.94f;
+        card.animate().scaleX(down).scaleY(down).setDuration(90).withEndAction(() -> {
+            launch(i);
+            card.animate().scaleX(up).scaleY(up).setDuration(160)
+                    .setInterpolator(new OvershootInterpolator(2f)).start();
+        }).start();
+    }
+
+    private void openInputs() {
+        int[] loc = new int[2];
+        pills[0].getLocationInWindow(loc);
+        // the menu is wider than the round button: keep it inside the right margin
+        inputs.open(Math.min(loc[0], W - side - dp(200)), loc[1] + pills[0].getHeight() + dp(10));
+    }
+
+    /** The tray's glass is the screen behind it: drawn at 1/8 size and blurred (a few ms at 160x90). */
+    private void openTray() {
+        final int scale = 8;
+        android.graphics.Bitmap shot = null;
+        try {
+            shot = android.graphics.Bitmap.createBitmap(Math.max(1, W / scale), Math.max(1, H / scale),
+                    android.graphics.Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas cv = new android.graphics.Canvas(shot);
+            cv.scale(1f / scale, 1f / scale);
+            root.draw(cv);
+            shot = Ui.blur(shot, 4, 3);
+        } catch (Exception ignored) {
+        }
+        tray.open(shot, scale);
+    }
+
+    private final SettingsTray.Host trayHost = new SettingsTray.Host() {
+        @Override
+        public void launch(Intent i) {
+            HomeActivity.this.launch(i);
+        }
+
+        @Override
+        public void openInputs() {
+            HomeActivity.this.openInputs();
+        }
+
+        @Override
+        public void nextWallpaper() {
+            main.removeCallbacks(HomeActivity.this.nextWallpaper);
+            HomeActivity.this.nextWallpaper.run();
+        }
+
+        @Override
+        public void wallpaperTimerChanged() {
+            scheduleWallpaper();
+        }
+    };
 
     private void launch(Intent i) {
         try {
@@ -744,8 +1001,18 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
             shift = gridTop - dp(78) + Math.max(0, row - 1) * rowH;
         }
         if (animate) content.animate().translationY(-shift).setDuration(380)
-                .setInterpolator(new DecelerateInterpolator(2f)).start();
+                .setInterpolator(new DecelerateInterpolator(2f))
+                .setUpdateListener(a -> band.invalidate())   // the frost samples what's behind it
+                .start();
         else content.setTranslationY(-shift);
+        band.invalidate();
+
+        // Top Shelf: only while you're moving along the dock (Home always opens on the photos)
+        if (animate && zone == Zone.DOCK && dockAdapter.getItemCount() > 0) {
+            showShelf(dockAdapter.apps.get(dockIdx).pkg);
+        } else if (zone != Zone.DOCK) {
+            hideShelf(450);
+        }
 
         // dock title + glow follow the dock selection
         if (dockAdapter.getItemCount() > 0 && dockIdx != lastTitleApp) {
@@ -763,14 +1030,80 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
                 dockTitle.setAlpha(titleAlpha());
             }
             setGlow(a.glow, animate);
+            showRecents();
         } else if (!titleChanging) {
             dockTitle.animate().alpha(titleAlpha()).setDuration(200).start();
         }
         glow.animate().alpha(zone == Zone.GRID ? 0f : zone == Zone.TOP ? 0.6f : 1f).setDuration(300).start();
 
         RectF target = targetRect();
+        boolean tile = zone == Zone.DOCK || zone == Zone.GRID;
+        highlight.setLift(tile);
         if (target != null) moveHighlight(target, animate && hlPlaced);
+        if (target != null && tile && animate) {
+            float m = dp(5);
+            sheen.sweep(new RectF(target.left + m, target.top + m, target.right - m, target.bottom - m),
+                    dp(10) * TileAdapter.FOCUS_SCALE, 240);
+        } else {
+            sheen.stop();
+        }
     }
+
+    // ---------------------------------------------------------------- Top Shelf
+
+    private int shelfRes(String pkg) {
+        return getResources().getIdentifier("shelf_" + pkg.replace('.', '_'), "drawable", getPackageName());
+    }
+
+    private void showShelf(String pkg) {
+        main.removeCallbacks(shelfIdle);
+        main.postDelayed(shelfIdle, SHELF_IDLE_MS);
+        if (pkg.equals(shelfPkg)) return;
+        int res = shelfRes(pkg);
+        if (res == 0) {
+            hideShelf(450);
+            return;
+        }
+        shelfPkg = pkg;
+        android.graphics.Bitmap[] cached = shelfCache.get(pkg);
+        if (cached != null) {
+            putShelf(pkg, cached);
+            return;
+        }
+        io.execute(() -> {
+            android.graphics.Bitmap img = loadWallpaper(res);
+            android.graphics.Bitmap[] pair = {img, Frost.blurred(img)};
+            main.post(() -> {
+                shelfCache.put(pkg, pair);
+                if (pkg.equals(shelfPkg)) putShelf(pkg, pair);
+            });
+        });
+    }
+
+    /** Crossfades a shelf picture in over the photos (or over the previous app's picture). */
+    private void putShelf(String pkg, android.graphics.Bitmap[] pair) {
+        if (pair[0] == null) return;
+        ImageView front = shelfViews[shelfFront], back = shelfViews[1 - shelfFront];
+        back.setImageBitmap(pair[0]);
+        back.animate().alpha(1f).setDuration(450).start();
+        front.animate().alpha(0f).setDuration(450).start();
+        shelfFront = 1 - shelfFront;
+        if (frost != null) frost.setSource(pair[1], 450);
+    }
+
+    /** Back to the photos. */
+    private void hideShelf(long ms) {
+        main.removeCallbacks(shelfIdle);
+        if (shelfPkg == null || shelfViews[0] == null) return;
+        shelfPkg = null;
+        for (ImageView v : shelfViews) {
+            if (ms == 0) v.setAlpha(0f);
+            else v.animate().alpha(0f).setDuration(ms).start();
+        }
+        if (frost != null && wallBlur != null) frost.setSource(wallBlur, ms);
+    }
+
+    private final Runnable shelfIdle = () -> hideShelf(900);
 
     private float titleAlpha() {
         return zone == Zone.TOP ? 0.55f : 1f;
@@ -784,6 +1117,14 @@ public class HomeActivity extends Activity implements Wallpapers.Listener {
             float o = dp(3);
             hlRadius = p.getHeight() / 2f + o;
             return new RectF(x - o, y - o, x + p.getWidth() + o, y + p.getHeight() + o);
+        }
+        if (zone == Zone.RECENT) {
+            View card = recentCards[recentIdx];
+            float x = recentRow.getLeft() + card.getLeft(), y = recentRow.getTop() + card.getTop();
+            if (card.getWidth() == 0) return null;
+            float o = dp(3);
+            hlRadius = dp(15);
+            return new RectF(x - o, y - o, x + card.getWidth() + o, y + card.getHeight() + o);
         }
         RecyclerView rv = zone == Zone.DOCK ? dockRv : gridRv;
         int pos = zone == Zone.DOCK ? dockIdx : gridIdx;
