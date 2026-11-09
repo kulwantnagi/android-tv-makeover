@@ -75,7 +75,7 @@ final class PlayHistory {
                 return;
             }
             boolean changed = false;
-            for (String[] p : parse(dump)) changed |= record(c, p[0], p[1], p[2]);
+            for (String[] p : parse(c, dump)) changed |= record(c, p[0], p[1], p[2]);
             changed |= fillArt(c);
             Listener l = listener;
             if (changed && l != null) main.post(l::onHistoryChanged);
@@ -145,29 +145,95 @@ final class PlayHistory {
     // ---------------------------------------------------------------- dumpsys
 
     /** {package, title, subtitle} of every session that is playing. */
-    private static List<String[]> parse(String dump) {
+    private static final java.util.regex.Pattern HEADER =
+            java.util.regex.Pattern.compile("^( +)\\S.* ([A-Za-z0-9._]+)/.* \\(userId=\\d+\\)$");
+    private static final java.util.regex.Pattern STACK =
+            java.util.regex.Pattern.compile("Sessions Stack - have (\\d+) sessions");
+
+    /**
+     * Playing sessions as {package, title, subtitle}. Apps control their titles, and a title can
+     * contain line breaks, so this is strict about what it believes: fields count only at the
+     * exact indentation of a session block and only once per block, the package must match the
+     * session's own header line and belong to its owner uid (checked with PackageManager, not the
+     * text), and if the number of session blocks differs from the count dumpsys states (someone
+     * injected extra "sessions"), nothing from this reading is used.
+     */
+    private static List<String[]> parse(Context c, String dump) {
         List<String[]> out = new ArrayList<>();
-        String pkg = null;
-        boolean playing = false;
-        for (String raw : dump.split("\n")) {
-            String line = raw.trim();
-            if (line.startsWith("package=")) {
-                pkg = line.substring(8);
-                playing = false;
-            } else if (line.startsWith("state=")) {
-                playing = line.startsWith("state=PlaybackState {state=3,");   // STATE_PLAYING
-            } else if (line.startsWith("metadata:") && pkg != null && playing) {
-                int d = line.indexOf("description=");
-                if (d < 0) continue;
-                // MediaDescription.toString() is "title, subtitle, description"; a title may contain ", "
-                String[] parts = line.substring(d + 12).split(", ");
-                int n = parts.length;
-                String title = n >= 3 ? String.join(", ", java.util.Arrays.copyOf(parts, n - 2)) : parts[0];
-                String sub = n >= 3 ? parts[n - 2] : n == 2 ? parts[1] : "";
-                out.add(new String[]{pkg, clean(title), clean(sub)});
+        android.content.pm.PackageManager pm = c.getPackageManager();
+        int expected = -1, headers = 0;
+        String owner = null, pkg = null, state = null, meta = null;
+        int fieldIndent = -1, uid = -1;
+        String[] lines = dump.split("\n");
+        for (int i = 0; i <= lines.length; i++) {
+            String raw = i < lines.length ? lines[i].replace("\r", "") : null;
+            java.util.regex.Matcher h = raw == null ? null : HEADER.matcher(raw);
+            boolean header = h != null && h.matches();
+            boolean stackEnd = raw != null && !raw.isEmpty() && fieldIndent >= 0 && !header
+                    && indent(raw) < fieldIndent;
+            if (raw == null || header || stackEnd) {
+                // close the block before starting another one
+                if (owner != null && owner.equals(pkg) && uid >= 0 && meta != null
+                        && state != null && state.startsWith("PlaybackState {state=3,")) {
+                    String[] owned = pm.getPackagesForUid(uid);
+                    if (owned != null && java.util.Arrays.asList(owned).contains(pkg)) {
+                        String[] tm = titleOf(meta);
+                        if (tm != null) out.add(new String[]{pkg, tm[0], tm[1]});
+                    }
+                }
+                owner = pkg = state = meta = null;
+                uid = -1;
+                fieldIndent = -1;
+                if (header) {
+                    headers++;
+                    owner = h.group(2);
+                    fieldIndent = h.group(1).length() + 2;
+                }
+                continue;
             }
+            java.util.regex.Matcher st = STACK.matcher(raw);
+            if (st.find()) expected = Integer.parseInt(st.group(1));
+            if (fieldIndent < 0 || indent(raw) != fieldIndent) continue;
+            String line = raw.trim();
+            if (pkg == null && line.startsWith("package=")) pkg = line.substring(8);
+            else if (uid < 0 && line.startsWith("ownerPid=")) uid = intAfter(line, "ownerUid=");
+            else if (state == null && line.startsWith("state=")) state = line.substring(6);
+            else if (meta == null && line.startsWith("metadata:")) meta = line;
         }
+        if (expected >= 0 && headers != expected) return new ArrayList<>();
         return out;
+    }
+
+    private static int indent(String s) {
+        int n = 0;
+        while (n < s.length() && s.charAt(n) == ' ') n++;
+        return n;
+    }
+
+    private static int intAfter(String line, String key) {
+        int k = line.indexOf(key);
+        if (k < 0) return -1;
+        int e = k + key.length();
+        while (e < line.length() && Character.isDigit(line.charAt(e))) e++;
+        try {
+            return Integer.parseInt(line.substring(k + key.length(), e));
+        } catch (NumberFormatException ex) {
+            return -1;
+        }
+    }
+
+    /** "metadata:size=N, description=title, subtitle, description" -> {title, subtitle}. */
+    private static String[] titleOf(String meta) {
+        int d = meta.indexOf("description=");
+        if (d < 0) return null;
+        String desc = meta.substring(d + 12);
+        if (desc.equals("null")) return null;
+        // MediaDescription.toString() is "title, subtitle, description"; a title may contain ", "
+        String[] parts = desc.split(", ");
+        int n = parts.length;
+        String title = n >= 3 ? String.join(", ", java.util.Arrays.copyOf(parts, n - 2)) : parts[0];
+        String sub = n >= 3 ? parts[n - 2] : n == 2 ? parts[1] : "";
+        return new String[]{clean(title), clean(sub)};
     }
 
     private static String clean(String s) {

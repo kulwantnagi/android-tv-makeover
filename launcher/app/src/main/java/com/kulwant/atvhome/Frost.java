@@ -5,8 +5,6 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.Canvas;
 import android.graphics.Paint;
-import android.graphics.Path;
-import android.graphics.Rect;
 import android.graphics.RectF;
 import android.view.View;
 
@@ -17,12 +15,12 @@ import android.view.View;
  * A new background crossfades in.
  */
 final class Frost extends View {
-    private final Paint image = new Paint(Paint.FILTER_BITMAP_FLAG);
+    private final Paint image = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private final Paint imageBefore = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+    private final android.graphics.Matrix place = new android.graphics.Matrix();
     private final Paint tint = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint edge = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Path clip = new Path();
     private final RectF box = new RectF();
-    private final Rect dst = new Rect();
     private final int[] loc = new int[2];
     private final float radius;
     private final int screenW, screenH;
@@ -55,6 +53,10 @@ final class Frost extends View {
         if (fade != null) fade.cancel();
         before = ms > 0 ? now : null;
         now = blurredScreen;
+        image.setShader(new android.graphics.BitmapShader(now,
+                android.graphics.Shader.TileMode.CLAMP, android.graphics.Shader.TileMode.CLAMP));
+        imageBefore.setShader(before == null ? null : new android.graphics.BitmapShader(before,
+                android.graphics.Shader.TileMode.CLAMP, android.graphics.Shader.TileMode.CLAMP));
         if (before == null) {
             mix = 1f;
             invalidate();
@@ -73,34 +75,38 @@ final class Frost extends View {
     @Override
     protected void onSizeChanged(int w, int h, int ow, int oh) {
         box.set(0, 0, w, h);
-        clip.reset();
-        clip.addRoundRect(box, radius, radius, Path.Direction.CW);
     }
 
     @Override
     protected void onDraw(Canvas c) {
-        c.save();
-        c.clipPath(clip);
+        // the blurred screen as a texture on the rounded tray (no clip path: cheap on this GPU),
+        // placed so the part behind the tray lines up with the real background
         if (now != null) {
-            // the blurred screen, placed so the part behind the tray lines up with the real background
             getLocationInWindow(loc);
-            dst.set(-loc[0], -loc[1], screenW - loc[0], screenH - loc[1]);
             if (before != null && mix < 1f) {
-                image.setAlpha(255);
-                c.drawBitmap(before, null, dst, image);
+                place(before);
+                imageBefore.getShader().setLocalMatrix(place);
+                c.drawRoundRect(box, radius, radius, imageBefore);
                 image.setAlpha((int) (255 * mix));
             } else {
                 image.setAlpha(255);
             }
-            c.drawBitmap(now, null, dst, image);
+            place(now);
+            image.getShader().setLocalMatrix(place);
+            c.drawRoundRect(box, radius, radius, image);
         }
         // darken like the scrim behind the dock, then a light glass wash
         tint.setColor(0x8C000000);
-        c.drawRect(box, tint);
+        c.drawRoundRect(box, radius, radius, tint);
         tint.setColor(0x24FFFFFF);
-        c.drawRect(box, tint);
-        c.restore();
+        c.drawRoundRect(box, radius, radius, tint);
         float h = edge.getStrokeWidth() / 2f;
         c.drawRoundRect(box.left + h, box.top + h, box.right - h, box.bottom - h, radius, radius, edge);
+    }
+
+    /** Maps a small blurred screen onto this view: stretched to screen size, shifted to our position. */
+    private void place(Bitmap b) {
+        place.setScale(screenW / (float) b.getWidth(), screenH / (float) b.getHeight());
+        place.postTranslate(-loc[0], -loc[1]);
     }
 }

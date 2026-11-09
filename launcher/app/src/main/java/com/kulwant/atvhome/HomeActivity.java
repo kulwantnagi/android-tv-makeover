@@ -66,14 +66,13 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
     private ImageView wifiIcon;
     private View band;
     private Frost frost;
-    private Sheen sheen;
 
     // Top Shelf: while you move along the dock, the background becomes the focused app's picture
     // (res/drawable-nodpi/shelf_<package, dots as _>.jpg). Photos come back after SHELF_IDLE_MS
     // without a key press, when focus leaves the dock, or on returning Home.
-    private static final long SHELF_IDLE_MS = 20_000;
-    private final ImageView[] shelfViews = new ImageView[2];
-    private int shelfFront;
+    private static final long SHELF_IDLE_MS = 20_000, SHELF_SETTLE_MS = 350;
+    private final ImageView[] shelfViews = new ImageView[2];   // [0] below [1]
+    private final Runnable shelfSettle = this::shelfSettled;
     private String shelfPkg;   // app whose picture is up, or null when the photos show
     private final java.util.Map<String, android.graphics.Bitmap[]> shelfCache = new java.util.HashMap<>();
     private android.graphics.Bitmap wallBlur;
@@ -117,7 +116,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
     // rotating wallpapers: Files from the photo store (see Wallpapers)
     private final List<Object> wallpapers = new ArrayList<>();
     private final ImageView[] wpViews = new ImageView[2];
-    private int wpIdx, wpFront;
+    private int wpIdx;
 
     // ---------------------------------------------------------------- lifecycle
 
@@ -267,6 +266,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
         clampIndices();
         // Wait for the RecyclerViews to lay out before placing the highlight.
         content.post(() -> content.post(() -> applyFocus(hlPlaced)));
+        preloadShelves();
     }
 
     private void clampIndices() {
@@ -471,9 +471,6 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
         gridRv = recycler(new GridLayoutManager(this, COLS), gridAdapter);
         content.addView(gridRv, at(gridCell * COLS, rowH, side - (gridCell - gridCardW) / 2, gridTop));
 
-        // gloss that glides across a tile when focus lands on it (above the tiles)
-        sheen = new Sheen(this);
-        content.addView(sheen, new FrameLayout.LayoutParams(-1, -1));
 
         inputs = new InputsMenu(this);
         root.addView(inputs.panel);
@@ -744,15 +741,12 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
         io.execute(() -> {
             android.graphics.Bitmap bmp = loadWallpaper(src);
             if (bmp == null) return;
+            bmp.prepareToDraw();
             android.graphics.Bitmap blur = Frost.blurred(bmp);
             main.post(() -> {
                 wallBlur = blur;
                 if (shelfPkg == null && frost != null) frost.setSource(blur, 2000);
-                ImageView front = wpViews[wpFront], back = wpViews[1 - wpFront];
-                back.setImageBitmap(bmp);
-                back.animate().alpha(1f).setDuration(2000).start();
-                front.animate().alpha(0f).setDuration(2000).withEndAction(() -> front.setImageDrawable(null)).start();
-                wpFront = 1 - wpFront;
+                crossfade(wpViews[0], wpViews[1], bmp, 2000, true);
                 if (hasWindowFocus()) scheduleWallpaper();
             });
         });
@@ -1008,8 +1002,10 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
         band.invalidate();
 
         // Top Shelf: only while you're moving along the dock (Home always opens on the photos)
+        main.removeCallbacks(shelfSettle);
         if (animate && zone == Zone.DOCK && dockAdapter.getItemCount() > 0) {
-            showShelf(dockAdapter.apps.get(dockIdx).pkg);
+            // only once focus rests on an app: fast presses just move the frame
+            main.postDelayed(shelfSettle, SHELF_SETTLE_MS);
         } else if (zone != Zone.DOCK) {
             hideShelf(450);
         }
@@ -1040,19 +1036,39 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
         boolean tile = zone == Zone.DOCK || zone == Zone.GRID;
         highlight.setLift(tile);
         if (target != null) moveHighlight(target, animate && hlPlaced);
-        if (target != null && tile && animate) {
-            float m = dp(5);
-            sheen.sweep(new RectF(target.left + m, target.top + m, target.right - m, target.bottom - m),
-                    dp(10) * TileAdapter.FOCUS_SCALE, 240);
-        } else {
-            sheen.stop();
-        }
     }
 
     // ---------------------------------------------------------------- Top Shelf
 
     private int shelfRes(String pkg) {
         return getResources().getIdentifier("shelf_" + pkg.replace('.', '_'), "drawable", getPackageName());
+    }
+
+    /** Loads every dock app's Top Shelf picture in the background, so switching never waits for one. */
+    private void preloadShelves() {
+        if (shelfViews[0] == null) return;
+        for (AppRepo.App a : new java.util.ArrayList<>(dockAdapter.apps)) {
+            int res = shelfRes(a.pkg);
+            if (res == 0 || shelfCache.containsKey(a.pkg)) continue;
+            io.execute(() -> {
+                android.graphics.Bitmap[] pair = loadShelf(res);
+                main.post(() -> {
+                    if (!shelfCache.containsKey(a.pkg)) shelfCache.put(a.pkg, pair);
+                });
+            });
+        }
+    }
+
+    /** {picture, blurred copy}; also uploads the picture to the GPU now, not mid-fade. Off the main thread. */
+    private android.graphics.Bitmap[] loadShelf(int res) {
+        android.graphics.Bitmap img = loadWallpaper(res);
+        if (img != null) img.prepareToDraw();
+        return new android.graphics.Bitmap[]{img, Frost.blurred(img)};
+    }
+
+    /** Focus has rested on a dock app: show its picture. */
+    private void shelfSettled() {
+        if (zone == Zone.DOCK && dockIdx < dockAdapter.getItemCount()) showShelf(dockAdapter.apps.get(dockIdx).pkg);
     }
 
     private void showShelf(String pkg) {
@@ -1071,8 +1087,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
             return;
         }
         io.execute(() -> {
-            android.graphics.Bitmap img = loadWallpaper(res);
-            android.graphics.Bitmap[] pair = {img, Frost.blurred(img)};
+            android.graphics.Bitmap[] pair = loadShelf(res);
             main.post(() -> {
                 shelfCache.put(pkg, pair);
                 if (pkg.equals(shelfPkg)) putShelf(pkg, pair);
@@ -1083,12 +1098,36 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
     /** Crossfades a shelf picture in over the photos (or over the previous app's picture). */
     private void putShelf(String pkg, android.graphics.Bitmap[] pair) {
         if (pair[0] == null) return;
-        ImageView front = shelfViews[shelfFront], back = shelfViews[1 - shelfFront];
-        back.setImageBitmap(pair[0]);
-        back.animate().alpha(1f).setDuration(450).start();
-        front.animate().alpha(0f).setDuration(450).start();
-        shelfFront = 1 - shelfFront;
+        boolean shelfShowing = shelfViews[1].getAlpha() > 0f && shelfViews[1].getDrawable() != null;
+        crossfade(shelfViews[0], shelfViews[1], pair[0], 450, shelfShowing);
         if (frost != null) frost.setSource(pair[1], 450);
+    }
+
+    /**
+     * Fades {@code img} in on {@code upper} (drawn above {@code lower}). The picture showing now is
+     * first copied to {@code lower} at full opacity, so nothing behind (or the black window) shows
+     * through mid-fade. A fade still running is finished at once. {@code keepCurrent} false:
+     * nothing of this pair is showing, so the new picture fades in over whatever is below.
+     * The draw order never changes, so no layout pass.
+     */
+    private void crossfade(ImageView lower, ImageView upper, android.graphics.Bitmap img, long ms, boolean keepCurrent) {
+        lower.animate().cancel();
+        upper.animate().cancel();
+        android.graphics.Bitmap shown = keepCurrent ? bitmapOf(upper.getAlpha() > 0f ? upper : lower) : null;
+        lower.setImageBitmap(shown);
+        lower.setAlpha(shown != null ? 1f : 0f);
+        upper.setImageBitmap(img);
+        upper.setAlpha(0f);
+        upper.animate().alpha(1f).setDuration(ms).withEndAction(() -> {
+            lower.setAlpha(0f);
+            lower.setImageDrawable(null);
+        }).start();
+    }
+
+    private static android.graphics.Bitmap bitmapOf(ImageView v) {
+        android.graphics.drawable.Drawable d = v.getDrawable();
+        return d instanceof android.graphics.drawable.BitmapDrawable
+                ? ((android.graphics.drawable.BitmapDrawable) d).getBitmap() : null;
     }
 
     /** Back to the photos. */
@@ -1135,7 +1174,7 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
         float cy = rv.getTop() + vh.itemView.getTop() + card.getTop() + card.getHeight() / 2f;
         float hw = card.getWidth() * TileAdapter.FOCUS_SCALE / 2f + dp(5);
         float hh = card.getHeight() * TileAdapter.FOCUS_SCALE / 2f + dp(5);
-        hlRadius = dp(15);
+        hlRadius = dp(10) * TileAdapter.FOCUS_SCALE + dp(5);
         return new RectF(cx - hw, cy - hh, cx + hw, cy + hh);
     }
 
@@ -1153,6 +1192,8 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
         hlAnim = ValueAnimator.ofFloat(0f, 1f);
         hlAnim.setDuration(340);
         hlAnim.setInterpolator(new OvershootInterpolator(1.15f));
+        highlight.animate().cancel();
+        highlight.setAlpha(1f);
         hlAnim.addUpdateListener(va -> {
             float t = (float) va.getAnimatedValue();
             hl.set(from.left + (to.left - from.left) * t, from.top + (to.top - from.top) * t,

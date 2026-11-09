@@ -19,7 +19,7 @@ import java.util.List;
 /** Banner tiles for the dock and the grid. Focus is driven by HomeActivity, never by Android focus. */
 final class TileAdapter extends RecyclerView.Adapter<TileAdapter.Holder> {
 
-    static final float FOCUS_SCALE = 1.08f;
+    static final float FOCUS_SCALE = 1.14f;
 
     final List<AppRepo.App> apps = new ArrayList<>();
     private final int cellW, cardW, cardH, labelSpace;
