@@ -15,6 +15,13 @@ host any content, and channels can go offline at any time.
 - **1080p only:** only streams whose name contains `(1080p)` are kept. Several 1080p streams of the
   same channel become one tile with backup streams. Change the check in `_buildChannels` in
   `lib/provider/channels_provider.dart`.
+- **Hindi and Punjabi only:** channels are kept only if they appear on iptv-org's Hindi or Punjabi
+  language playlists. Change `languages` in `lib/provider/channels_provider.dart` (ISO 639-3 codes).
+- **Working streams first, dead channels hidden:** the app checks each stream's playlist in the
+  background and remembers what actually played or failed on the TV (`lib/provider/stream_health.dart`).
+  Channels open on their best-known stream, channels with no usable stream are left out, and every
+  verdict expires after a day. A stream whose audio the TV can't decode counts as failed, and a
+  surround track is swapped for the stereo one.
 - **Faster:** playlists download in parallel and are parsed off the UI thread; the result is cached so
   the app opens instantly and refreshes in the background; the grid builds lazily and logos are decoded
   small and cached on disk.

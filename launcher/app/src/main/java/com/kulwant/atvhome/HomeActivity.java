@@ -790,6 +790,27 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
 
     // ---------------------------------------------------------------- keys
 
+    /**
+     * The IR remote sends "still held" codes during even a short press, and Android turns them into
+     * repeated key presses, so one click could move two apps. Repeats count only after the key has
+     * been held a while, and then at a steady pace.
+     */
+    private static final long REPEAT_AFTER_MS = 400, REPEAT_EVERY_MS = 150;
+    private long lastRepeatAt, pressStartAt;
+
+    private static boolean isArrow(int k) {
+        return k == KeyEvent.KEYCODE_DPAD_UP || k == KeyEvent.KEYCODE_DPAD_DOWN
+                || k == KeyEvent.KEYCODE_DPAD_LEFT || k == KeyEvent.KEYCODE_DPAD_RIGHT;
+    }
+
+    private boolean takeRepeat(KeyEvent e) {
+        // Android resets getDownTime() on each remote repeat code, so time the press from its first DOWN
+        long t = e.getEventTime();
+        if (t - pressStartAt < REPEAT_AFTER_MS || t - lastRepeatAt < REPEAT_EVERY_MS) return false;
+        lastRepeatAt = t;
+        return true;
+    }
+
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
         int k = e.getKeyCode();
@@ -817,6 +838,8 @@ public class HomeActivity extends Activity implements Wallpapers.Listener, PlayH
             return true;
         }
 
+        if (isArrow(k) && e.getRepeatCount() == 0) pressStartAt = e.getEventTime();
+        if (isArrow(k) && e.getRepeatCount() > 0 && !takeRepeat(e)) return true;
         switch (k) {
             case KeyEvent.KEYCODE_DPAD_UP: up(); break;
             case KeyEvent.KEYCODE_DPAD_DOWN: down(); break;

@@ -6,6 +6,7 @@ import 'package:video_player/video_player.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../model/channel.dart';
+import '../provider/stream_health.dart';
 import '../widgets/channel_icon.dart';
 import 'home.dart' show isSelectKey;
 
@@ -64,7 +65,8 @@ class _PlayerState extends State<Player> {
     setState(() {});
     old?.dispose();
 
-    final c = VideoPlayerController.networkUrl(Uri.parse(channel.streamUrls[streamIdx]));
+    final url = channel.streamUrls[streamIdx];
+    final c = VideoPlayerController.networkUrl(Uri.parse(url));
     controller = c;
     startTimer?.cancel();
     startTimer = Timer(_startTimeout, () {
@@ -77,16 +79,52 @@ class _PlayerState extends State<Player> {
       await c.initialize();
       if (gen != _generation) return;
       startTimer?.cancel();
+      StreamHealth.instance.markPlayed(url);   // next time this channel opens on this stream
       await c.play();
+      _checkAudio(c, gen);
       if (mounted) setState(_flashInfo);
     } catch (_) {
       if (gen == _generation) _nextStream(gen);
     }
   }
 
+  /// Makes sure the stream has sound this TV can play.
+  ///
+  /// Some channels carry a second, surround (Dolby) audio track; the TV's speakers can't play it
+  /// and the player may pick it, giving silence: switch to the plain AAC / stereo track. And when
+  /// a stream has audio but the TV has no decoder for any of it (e.g. MP2), nothing is selected:
+  /// that counts as a failed stream, so a backup is tried and the stream is remembered as bad.
+  Future<void> _checkAudio(VideoPlayerController c, int gen) async {
+    try {
+      if (!c.isAudioTrackSupportAvailable()) return;
+      bool plain(VideoAudioTrack t) {
+        final codec = (t.codec ?? '').toLowerCase();
+        final surround = codec.contains('ac-3') || codec.contains('ac3') || codec.contains('ec-3') ||
+            codec.contains('eac3') || codec.contains('dts') || (t.channelCount ?? 2) > 2;
+        return !surround;
+      }
+      // tracks settle a moment after playback starts
+      await Future<void>.delayed(const Duration(seconds: 3));
+      if (gen != _generation || !mounted) return;
+      var tracks = await c.getAudioTracks();
+      if (tracks.isEmpty) return;   // a channel without any audio: nothing to choose
+      final current = tracks.where((t) => t.isSelected);
+      if (current.isNotEmpty && plain(current.first)) return;
+      final better = tracks.where(plain);
+      if (better.isNotEmpty) {
+        await c.selectAudioTrack(better.first.id);
+        await Future<void>.delayed(const Duration(seconds: 2));
+        if (gen != _generation || !mounted) return;
+        tracks = await c.getAudioTracks();
+      }
+      if (!tracks.any((t) => t.isSelected)) _nextStream(gen);   // no audio this TV can decode
+    } catch (_) {}
+  }
+
   /// Current stream failed: try the channel's next backup, else show the error.
   void _nextStream(int gen) {
     if (gen != _generation || !mounted) return;
+    StreamHealth.instance.markFailed(channel.streamUrls[streamIdx]);
     if (streamIdx + 1 < channel.streamUrls.length) {
       streamIdx++;
       _open();

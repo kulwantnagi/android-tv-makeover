@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 
 import '../model/channel.dart';
 import '../provider/channels_provider.dart';
+import '../provider/stream_health.dart';
 import '../widgets/channel_icon.dart';
 import 'player.dart';
 
@@ -89,13 +90,23 @@ class _HomeState extends State<Home> {
   }
 
   Future<void> _load() async {
-    // 1) cached list -> instant start
+    final health = StreamHealth.instance;
+    await health.load();
+    // 1) cached list -> instant start (best stream first, dead channels left out)
     final cached = await provider.loadCached();
-    if (cached != null && mounted) _setChannels(cached);
+    if (cached != null && mounted) _setChannels(health.apply(cached));
     // 2) fresh list in the background
     try {
       final fresh = await provider.refresh();
-      if (mounted) _setChannels(fresh);
+      if (mounted) _setChannels(health.apply(fresh));
+      // 3) check the streams; apply the result once the remote has been idle for a while,
+      //    so the grid doesn't change under your fingers
+      if (await health.check(fresh)) {
+        while (mounted && DateTime.now().difference(_lastInput) < const Duration(seconds: 8)) {
+          await Future<void>.delayed(const Duration(seconds: 3));
+        }
+        if (mounted) _setChannels(health.apply(fresh));
+      }
     } catch (e) {
       if (mounted && categories.isEmpty) {
         setState(() {
@@ -131,6 +142,12 @@ class _HomeState extends State<Home> {
     });
     _prebuildTimer?.cancel();
     _prebuildTimer = Timer.periodic(const Duration(milliseconds: 400), (_) => _prebuildNext());
+    if (!first) {
+      // the grid was rebuilt: put focus back on the current category
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && ModalRoute.of(context)?.isCurrent == true) sideNodes[selected].requestFocus();
+      });
+    }
     if (first) {
       WidgetsBinding.instance.addPostFrameCallback((_) => sideNodes[selected].requestFocus());
     }
@@ -417,7 +434,9 @@ class _HomeState extends State<Home> {
       ),
       itemCount: list.length,
       itemBuilder: (context, i) => _Tile(
-        key: ValueKey('$cat/$i'),
+        // the channel is part of the key: when the list changes, a tile must not keep the
+        // previous channel's logo
+        key: ValueKey('$cat/$i/${list[i].name}'),
         channel: list[i],
         node: tileNodes.putIfAbsent('$cat/$i', () => FocusNode()),
         cardW: cardW,

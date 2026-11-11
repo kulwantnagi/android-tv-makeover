@@ -21,7 +21,7 @@ const categoryOrder = [
   'Other',
 ];
 
-/// Loads every playlist in the catalog, keeps 1080p streams only, adds logos and
+/// Loads every playlist in the catalog, keeps 1080p Hindi and Punjabi streams only, adds logos and
 /// categories from the iptv-org India index, and caches the result on disk.
 class ChannelsProvider {
   static const streamsCatalogUrl =
@@ -30,7 +30,12 @@ class ChannelsProvider {
   /// Carries logos and group-titles (categories) for Indian channels.
   static const logoIndexUrl = 'https://iptv-org.github.io/iptv/countries/in.m3u';
 
-  static const _cacheFile = 'channels_v2.json';
+  /// Only channels in these languages are kept (ISO 639-3 codes; iptv-org publishes a playlist per
+  /// language listing its channels): Hindi and Punjabi.
+  static const languages = ['hin', 'pan'];
+  static String languageUrl(String code) => 'https://iptv-org.github.io/iptv/languages/$code.m3u';
+
+  static const _cacheFile = 'channels_v3.json';   // v3: language filter (older caches had every language)
   static const _timeout = Duration(seconds: 20);
 
   /// Last result saved on disk, so the app can show channels instantly on start.
@@ -54,15 +59,23 @@ class ChannelsProvider {
     final responses = await Future.wait([
       http.get(Uri.parse(logoIndexUrl)).timeout(_timeout).then((r) => r.statusCode == 200 ? r.body : '',
           onError: (_) => ''),
+      for (final l in languages)
+        http.get(Uri.parse(languageUrl(l))).timeout(_timeout).then((r) => r.statusCode == 200 ? r.body : '',
+            onError: (_) => ''),
       for (final s in sources)
         http.get(Uri.parse(s.value)).timeout(_timeout).then((r) => r.statusCode == 200 ? r.body : '',
             onError: (_) => ''),
     ]);
 
+    final langBodies = responses.sublist(1, 1 + languages.length);
+    // without the language lists we can't filter: keep the last good (cached) list instead
+    if (langBodies.every((b) => b.isEmpty)) throw Exception('Failed to load channel languages');
+    final first = 1 + languages.length;
     final args = <String, dynamic>{
       'index': responses.first,
+      'languages': langBodies,
       'playlists': [
-        for (var i = 0; i < sources.length; i++) {'name': sources[i].key, 'body': responses[i + 1]},
+        for (var i = 0; i < sources.length; i++) {'name': sources[i].key, 'body': responses[first + i]},
       ],
     };
     final json = await compute(_buildChannels, args);
@@ -195,6 +208,16 @@ List<Map<String, dynamic>> _buildChannels(Map<String, dynamic> args) {
     }
   }
 
+  // channels in the wanted languages, matched by channel id, then by name
+  final langIds = <String>{}, langNames = <String>{};
+  for (final body in (args['languages'] as List).cast<String>()) {
+    for (final e in _entries(body)) {
+      final id = _baseId(e.attr(_tvgId));
+      if (id.isNotEmpty) langIds.add(id);
+      langNames.add(_nameKey(e.name));
+    }
+  }
+
   // merge all playlists; same channel in the same category -> one tile with backup streams
   final byKey = <String, Map<String, dynamic>>{};
   for (final p in (args['playlists'] as List).cast<Map>()) {
@@ -204,6 +227,7 @@ List<Map<String, dynamic>> _buildChannels(Map<String, dynamic> args) {
       final id = e.attr(_tvgId);
       final base = _baseId(id);
       final key = _nameKey(e.name);
+      if (!langIds.contains(base) && !langNames.contains(key)) continue;   // Hindi / Punjabi only
       final category = sportsList
           ? 'Sports'
           : _category(e.attr(_group).isNotEmpty ? e.attr(_group) : (groupById[base] ?? groupByName[key] ?? ''));
